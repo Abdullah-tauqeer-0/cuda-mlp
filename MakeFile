@@ -1,0 +1,13 @@
+TARGET = mlp
+SRC = src/main.cu src/mlp.cu src/utils.cu
+INC = -Iinclude
+
+NVCC = nvcc
+NVCCFLAGS = -O3 -arch=sm_52 $(INC)
+
+all:
+	mkdir -p build
+	$(NVCC) $(NVCCFLAGS) $(SRC) -o build/$(TARGET)
+
+clean:
+	rm -rf build
