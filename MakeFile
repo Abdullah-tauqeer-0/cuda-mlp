@@ -5,9 +5,14 @@ INC = -Iinclude
 NVCC = nvcc
 NVCCFLAGS = -O3 -arch=sm_52 $(INC)
 
+SRC = src/main.cu src/mlp.cu src/utils.cu src/csv.cpp   # added csv.cpp
+
 all:
 	mkdir -p build
 	$(NVCC) $(NVCCFLAGS) $(SRC) -o build/$(TARGET)
 
 clean:
 	rm -rf build
+
+profile:
+	ncu --set full --kernel-name k_linear_mm ./build/mlp
