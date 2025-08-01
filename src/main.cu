@@ -1,110 +1,53 @@
-// src/main.cu  (full file replaces old version)
-#include <cstdio>
-#include <vector>
-#include <cuda_runtime.h>
-#include "mlp.hpp"
-#include "utils.hpp"
-#include "csv.hpp"
+#include "dataloader.hpp"          // ➊ include the header
 
-// ---------- Device-side MSE loss & gradient (same as before) ---------- //
-__global__ void k_mse_loss_grad(const fp32* y_pred, const fp32* y_true,
-                                fp32* d_loss, fp32* loss_out, size_t batch);
-// … (kernel body identical to previous prompt) …
+// --- FLAGS ------------------------------------------------------------ //
+size_t batch_size = 32;            // ➋ add default
+float  val_ratio  = 0.2f;
 
-// ---------------------- Helper: upload host vectors ------------------- //
-static void upload(const std::vector<fp32>& h,
-                   fp32*& d, cudaMemcpyKind kind = cudaMemcpyHostToDevice)
-{
-    CUDA_CHECK(cudaMalloc(&d, h.size()*sizeof(fp32)));
-    CUDA_CHECK(cudaMemcpy(d, h.data(),
-                          h.size()*sizeof(fp32), kind));
-}
+...
+else if (arg == "--batch" && i+1 < argc) batch_size = std::stoul(argv[++i]);
+else if (arg == "--val"   && i+1 < argc) val_ratio  = std::stof(argv[++i]);
+...
 
-// --------------------------------------------------------------------- //
-int main(int argc, char** argv)
-{
-    // ---------------------------------------------------------------- //
-    // 1.  Parse flags: csv path, epochs, lr (all optional)
-    // ---------------------------------------------------------------- //
-    std::string csv_path;
-    int   epochs = 3000;
-    fp32  lr     = 1e-1f;
+// 2.  Load data (unchanged, produces h_X, h_y, in_dim, etc.)
 
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--csv" && i+1 < argc) csv_path = argv[++i];
-        else if (arg == "--epochs" && i+1 < argc) epochs = std::stoi(argv[++i]);
-        else if (arg == "--lr" && i+1 < argc)     lr     = std::stof(argv[++i]);
-        else {
-            printf("Usage: %s [--csv path] [--epochs N] [--lr val]\n", argv[0]);
-            return 0;
-        }
-    }
+// 2-b NEW: create DataLoader
+DataLoader loader(h_X, h_y, in_dim, val_ratio);
 
-    // ---------------------------------------------------------------- //
-    // 2.  Load data
-    // ---------------------------------------------------------------- //
-    std::vector<fp32> h_X, h_y;
-    size_t in_dim = 2;                    // default XOR dims
-    if (!csv_path.empty()) {
-        load_csv(csv_path, h_X, h_y, in_dim);
-    } else {
-        // XOR fallback
-        h_X = {0,0,  0,1,  1,0,  1,1};
-        h_y = {0,1,1,0};
-    }
-    const size_t batch = h_y.size();
-    const size_t out_dim = 1;             // binary regression
+// 4. Buffers (remove old upload code – DataLoader handles it)
+float *d_pred, *d_grad, *d_loss_scalar;
+CUDA_CHECK(cudaMalloc(&d_grad,  batch_size * out_dim * sizeof(float)));
+CUDA_CHECK(cudaMalloc(&d_loss_scalar, sizeof(float)));
 
-    fp32 *d_X, *d_y;
-    upload(h_X, d_X);
-    upload(h_y, d_y);
+const int TPB = 128;
 
-    // ---------------------------------------------------------------- //
-    // 3.  Build network
-    // ---------------------------------------------------------------- //
-    std::vector<size_t> dims = {in_dim, 8, out_dim};
-    std::vector<ActType> acts = {ActType::RELU, ActType::SIGMOID};
-    MLP net(dims, acts, lr);
+// 5. Training loop – iterate over mini-batches ➌
+for (int epoch = 0; epoch < epochs; ++epoch) {
+    size_t n_batches = loader.batches(batch_size, /*train=*/true);
+    for (size_t bi = 0; bi < n_batches; ++bi) {
+        auto [d_X, d_y, cur_bs] = loader.next_batch(batch_size, true);
 
-    // ---------------------------------------------------------------- //
-    // 4.  Buffers
-    // ---------------------------------------------------------------- //
-    fp32 *d_grad, *d_loss_scalar;
-    CUDA_CHECK(cudaMalloc(&d_grad,  batch*out_dim*sizeof(fp32)));
-    CUDA_CHECK(cudaMalloc(&d_loss_scalar, sizeof(fp32)));
+        d_pred = const_cast<float*>(net.forward(d_X, cur_bs));
 
-    // ---------------------------------------------------------------- //
-    // 5.  Training loop
-    // ---------------------------------------------------------------- //
-    constexpr int TPB = 128;
-    int blocks = (batch + TPB - 1) / TPB;
-
-    for (int epoch = 0; epoch < epochs; ++epoch) {
-        const fp32* d_pred = net.forward(d_X, batch);
-
-        // zero loss
-        CUDA_CHECK(cudaMemset(d_loss_scalar, 0, sizeof(fp32)));
-
+        cudaMemset(d_loss_scalar, 0, sizeof(float));
+        int blocks = (cur_bs + TPB - 1) / TPB;
         k_mse_loss_grad<<<blocks, TPB>>>(d_pred, d_y,
-                                         d_grad, d_loss_scalar, batch);
+                                         d_grad, d_loss_scalar, cur_bs);
 
-        net.backward(d_y, d_grad, batch);
+        net.backward(d_y, d_grad, cur_bs);
         net.step();
-
-        if (epoch % 200 == 0) {
-            fp32 h_loss;
-            CUDA_CHECK(cudaMemcpy(&h_loss, d_loss_scalar,
-                                  sizeof(fp32), cudaMemcpyDeviceToHost));
-            printf("Epoch %5d | MSE %.6f\n", epoch, h_loss);
-        }
     }
 
-    // ---------------------------------------------------------------- //
-    // 6.  Cleanup
-    // ---------------------------------------------------------------- //
-    cudaFree(d_X); cudaFree(d_y);
-    cudaFree(d_grad); cudaFree(d_loss_scalar);
-    printf("Done.\n");
-    return 0;
+    if (epoch % 50 == 0) {      // quick val loss
+        auto [d_Xv, d_yv, bs] = loader.next_batch(batch_size, false);
+        d_pred = const_cast<float*>(net.forward(d_Xv, bs));
+        cudaMemset(d_loss_scalar, 0, sizeof(float));
+        int blocks = (bs + TPB - 1) / TPB;
+        k_mse_loss_grad<<<blocks, TPB>>>(d_pred, d_yv,
+                                         d_grad, d_loss_scalar, bs);
+        float h_loss;
+        cudaMemcpy(&h_loss, d_loss_scalar, sizeof(float),
+                   cudaMemcpyDeviceToHost);
+        printf("Epoch %4d | Val-MSE %.6f\n", epoch, h_loss);
+    }
 }
